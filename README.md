@@ -21,7 +21,7 @@ Add `contacts_service_plus` to your `pubspec.yaml`:
 
 ```yaml
 dependencies:
-  contacts_service_plus: ^0.6.3
+  contacts_service_plus: ^0.0.2
 ```
 
 Then run:
