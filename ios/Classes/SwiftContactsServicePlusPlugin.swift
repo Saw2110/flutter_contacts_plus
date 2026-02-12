@@ -7,20 +7,74 @@ import ContactsUI
 public class SwiftContactsServicePlusPlugin: NSObject, FlutterPlugin, CNContactViewControllerDelegate, CNContactPickerDelegate {
     private var result: FlutterResult? = nil
     private var localizedLabels: Bool = true
-    private let rootViewController: UIViewController
+    private weak var registrar: FlutterPluginRegistrar?
     static let FORM_OPERATION_CANCELED: Int = 1
     static let FORM_COULD_NOT_BE_OPEN: Int = 2
     
     public static func register(with registrar: FlutterPluginRegistrar) {
         let channel = FlutterMethodChannel(name: "github.com/clovisnicolas/flutter_contacts", binaryMessenger: registrar.messenger())
-        let rootViewController = UIApplication.shared.delegate!.window!!.rootViewController!;
-        let instance = SwiftContactsServicePlusPlugin(rootViewController)
+        let instance = SwiftContactsServicePlusPlugin(registrar)
         registrar.addMethodCallDelegate(instance, channel: channel)
         instance.preLoadContactView()
     }
 
-    init(_ rootViewController: UIViewController) {
-        self.rootViewController = rootViewController
+    init(_ registrar: FlutterPluginRegistrar) {
+        self.registrar = registrar
+        super.init()
+    }
+
+    private func getRootViewController() -> UIViewController? {
+        print("[ContactsPlugin] Attempting to get root view controller...")
+
+        // Try to get from registrar first (works in non-UIScene setups)
+        if let viewController = registrar?.viewController {
+            print("[ContactsPlugin] ✅ Got view controller from registrar: \(type(of: viewController))")
+            return viewController
+        }
+        print("[ContactsPlugin] ⚠️ Registrar view controller not available, trying UIScene fallback...")
+
+        // Fallback for UIScene setups (iOS 13+)
+        if #available(iOS 13.0, *) {
+            print("[ContactsPlugin] Checking connected scenes...")
+
+            // First try to get the foreground active scene (best for multi-window apps)
+            if let windowScene = UIApplication.shared.connectedScenes
+                .filter({ $0.activationState == .foregroundActive })
+                .first as? UIWindowScene {
+                print("[ContactsPlugin] Found foreground active window scene: \(windowScene)")
+                if let rootVC = windowScene.windows.first(where: { $0.isKeyWindow })?.rootViewController
+                   ?? windowScene.windows.first?.rootViewController {
+                    print("[ContactsPlugin] ✅ Got view controller from active UIScene: \(type(of: rootVC))")
+                    return rootVC
+                } else {
+                    print("[ContactsPlugin] ⚠️ Active UIScene window has no root view controller")
+                }
+            }
+
+            // Fallback to first connected scene if no foreground active scene
+            print("[ContactsPlugin] No foreground active scene, trying first connected scene...")
+            if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene {
+                print("[ContactsPlugin] Found window scene: \(windowScene)")
+                if let rootVC = windowScene.windows.first?.rootViewController {
+                    print("[ContactsPlugin] ✅ Got view controller from first UIScene: \(type(of: rootVC))")
+                    return rootVC
+                } else {
+                    print("[ContactsPlugin] ⚠️ UIScene window has no root view controller")
+                }
+            } else {
+                print("[ContactsPlugin] ⚠️ No UIWindowScene found in connected scenes")
+            }
+        }
+
+        // Fallback for older iOS versions or when scene is not available
+        print("[ContactsPlugin] Trying app delegate window fallback...")
+        if let rootVC = UIApplication.shared.delegate?.window??.rootViewController {
+            print("[ContactsPlugin] ✅ Got view controller from app delegate: \(type(of: rootVC))")
+            return rootVC
+        }
+
+        print("[ContactsPlugin] ❌ Failed to get root view controller from all methods")
+        return nil
     }
 
     public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
@@ -55,6 +109,11 @@ public class SwiftContactsServicePlusPlugin: NSObject, FlutterPlugin, CNContactV
                     localizedLabels: arguments["iOSLocalizedLabels"] as! Bool
                 )
             )
+        case "getAvatar":
+            let arguments = call.arguments as! [String:Any]
+            let contactDict = arguments["contact"] as! [String:Any]
+            let photoHighRes = arguments["photoHighResolution"] as! Bool
+            result(getAvatar(contact: contactDict, photoHighResolution: photoHighRes))
         case "addContact":
             let contact = dictionaryToContact(dictionary: call.arguments as! [String : Any])
 
@@ -212,14 +271,42 @@ public class SwiftContactsServicePlusPlugin: NSObject, FlutterPlugin, CNContactV
         return ""
     }
 
+    func getAvatar(contact: [String:Any], photoHighResolution: Bool) -> FlutterStandardTypedData? {
+        guard let identifier = contact["identifier"] as? String else {
+            return nil
+        }
+
+        let store = CNContactStore()
+        let keys = photoHighResolution ? [CNContactImageDataKey] : [CNContactThumbnailImageDataKey]
+
+        do {
+            let cnContact = try store.unifiedContact(withIdentifier: identifier, keysToFetch: keys as [CNKeyDescriptor])
+
+            if photoHighResolution {
+                if let imageData = cnContact.imageData {
+                    return FlutterStandardTypedData(bytes: imageData)
+                }
+            } else {
+                if let thumbnailData = cnContact.thumbnailImageData {
+                    return FlutterStandardTypedData(bytes: thumbnailData)
+                }
+            }
+        } catch {
+            print("Error fetching avatar: \(error.localizedDescription)")
+        }
+
+        return nil
+    }
+
     func openContactForm() -> [String:Any]? {
         let contact = CNMutableContact.init()
         let controller = CNContactViewController.init(forNewContact:contact)
         controller.delegate = self
         DispatchQueue.main.async {
-         let navigation = UINavigationController .init(rootViewController: controller)
-         let viewController : UIViewController? = UIApplication.shared.delegate?.window??.rootViewController
-            viewController?.present(navigation, animated:true, completion: nil)
+            let navigation = UINavigationController .init(rootViewController: controller)
+            if let viewController = self.getRootViewController() {
+                viewController.present(navigation, animated:true, completion: nil)
+            }
         }
         return nil
     }
@@ -233,8 +320,9 @@ public class SwiftContactsServicePlusPlugin: NSObject, FlutterPlugin, CNContactV
     
     @objc func cancelContactForm() {
         if let result = self.result {
-            let viewController : UIViewController? = UIApplication.shared.delegate?.window??.rootViewController
-            viewController?.dismiss(animated: true, completion: nil)
+            if let viewController = self.getRootViewController() {
+                viewController.dismiss(animated: true, completion: nil)
+            }
             result(SwiftContactsServicePlusPlugin.FORM_OPERATION_CANCELED)
             self.result = nil
         }
@@ -252,7 +340,7 @@ public class SwiftContactsServicePlusPlugin: NSObject, FlutterPlugin, CNContactV
         }
     }
 
-    func openExistingContact(contact: [String:Any], result: FlutterResult ) ->  [String:Any]? {
+    func openExistingContact(contact: [String:Any], result: @escaping FlutterResult ) ->  [String:Any]? {
          let store = CNContactStore()
          do {
             // Check to make sure dictionary has an identifier
@@ -277,17 +365,33 @@ public class SwiftContactsServicePlusPlugin: NSObject, FlutterPlugin, CNContactV
              viewController.delegate = self
             DispatchQueue.main.async {
                 let navigation = UINavigationController .init(rootViewController: viewController)
-                var currentViewController = UIApplication.shared.keyWindow?.rootViewController
+                var currentViewController = self.getRootViewController()
                 while let nextView = currentViewController?.presentedViewController {
                     currentViewController = nextView
                 }
+
+                guard let presentingVC = currentViewController else {
+                    result(SwiftContactsServicePlusPlugin.FORM_COULD_NOT_BE_OPEN)
+                    return
+                }
+
+                // Get the window frame for activity indicator
+                var windowFrame = CGRect.zero
+                if #available(iOS 13.0, *) {
+                    if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene {
+                        windowFrame = windowScene.windows.first?.frame ?? CGRect.zero
+                    }
+                } else {
+                    windowFrame = UIApplication.shared.keyWindow?.frame ?? CGRect.zero
+                }
+
                 let activityIndicatorView = UIActivityIndicatorView.init(style: UIActivityIndicatorView.Style.gray)
-                activityIndicatorView.frame = (UIApplication.shared.keyWindow?.frame)!
+                activityIndicatorView.frame = windowFrame
                 activityIndicatorView.startAnimating()
                 activityIndicatorView.backgroundColor = UIColor.white
                 navigation.view.addSubview(activityIndicatorView)
-                currentViewController!.present(navigation, animated: true, completion: nil)
-                
+                presentingVC.present(navigation, animated: true, completion: nil)
+
                 DispatchQueue.main.asyncAfter(deadline: .now()+0.5 ){
                     activityIndicatorView.removeFromSuperview()
                 }
@@ -308,7 +412,11 @@ public class SwiftContactsServicePlusPlugin: NSObject, FlutterPlugin, CNContactV
         contactPicker.delegate = self
         //contactPicker!.displayedPropertyKeys = [CNContactPhoneNumbersKey];
         DispatchQueue.main.async {
-            self.rootViewController.present(contactPicker, animated: true, completion: nil)
+            guard let viewController = self.getRootViewController() else {
+                result(FlutterError(code: "NO_VIEW_CONTROLLER", message: "Unable to get root view controller", details: nil))
+                return
+            }
+            viewController.present(contactPicker, animated: true, completion: nil)
         }
     }
 
