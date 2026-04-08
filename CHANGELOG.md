@@ -1,7 +1,33 @@
 # Changelog
 
-## [0.0.2]
- 
+## [0.0.3] - April 8, 2026
+
+### Added
+- iOS UIScene support for modern iOS applications (iOS 13+)
+- Enhanced iOS view controller resolution with multiple fallback strategies
+- Support for multi-window iPad applications
+- Improved `getAvatar` method with high-resolution photo support
+
+### Changed
+- iOS minimum deployment target updated from 8.0 to 13.0
+- Refactored iOS plugin architecture to use FlutterPluginRegistrar instead of direct UIApplication access
+- Enhanced iOS contact form presentation logic for better compatibility
+
+### Fixed
+- iOS crashes in apps using UIScene-based lifecycle (iOS 13+)
+- Contact form presentation issues in modern iOS applications
+- View controller access in multi-window scenarios
+- README version number accuracy
+
+### Technical Details
+- Replaced deprecated `UIApplication.shared.delegate.window` with UIScene-aware view controller resolution
+- Added comprehensive logging for iOS view controller debugging
+- Improved error handling for contact form operations
+
+## [0.0.2] - June 2025
+
+### Fixed
+- iOS bug fixes and stability improvements
 
 ## [0.0.1] - June 3, 2025
 

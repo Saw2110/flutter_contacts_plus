@@ -1,6 +1,6 @@
 name: contacts_service_plus
 description: A Flutter plugin to retrieve and manage contacts on Android and iOS devices.
-version: 0.0.2
+version: 0.0.3
 homepage: https://github.com/Saw2110/flutter_contacts_plus.git
 
 environment:
