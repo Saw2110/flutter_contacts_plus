@@ -1,17 +1,6 @@
 group 'flutter.plugins.contactsservice.contactsservice'
 version '1.0-SNAPSHOT'
 
-buildscript {
-    repositories {
-        google()
-        mavenCentral()
-    }
-
-    dependencies {
-        classpath 'com.android.tools.build:gradle:8.4.0'
-    }
-}
-
 rootProject.allprojects {
     repositories {
         google()
@@ -23,22 +12,19 @@ apply plugin: 'com.android.library'
 
 android {
     namespace 'flutter.plugins.contactsservice.contactsservice'
-    compileSdkVersion 34
+    compileSdk 36
 
     defaultConfig {
-        minSdkVersion 21
-        targetSdkVersion 34
-        versionCode 1
-        versionName "1.0"
+        minSdk 21
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }
-    
+
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
-    
-    lintOptions {
+
+    lint {
         disable 'InvalidPackage'
     }
 }

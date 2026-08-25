@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.0.4] - August 25, 2026
+
+### Fixed
+
+Android
+ - Fixed a fatal crash when the activity is destroyed while contacts are still loading (#3, thanks @ooglek).
+ - Reading a contact photo no longer throws on invalid identifier, revoked permission, or undecodable image; falls back to an empty avatar.
+ - Fixed crash when the device contact picker is closed without a selection.
+ - Background failures now surface as a `PlatformException` instead of crashing.
+
+ios
+ - The contact form, existing-contact view, and picker now open correctly when another modal is already on screen.
+ - `openContactForm` no longer hangs when no view controller is available.
+
+### Changed
+
+Android
+ - Replaced deprecated `AsyncTask`, removing the "uses or overrides a deprecated API" build warning (#2, thanks @tylyo).
+ - Raised `compileSdk` to 36 and modernized the build script for AGP 8.
+
+ios
+ - Removed deprecated `keyWindow` usage and dead pre‑iOS‑13 code paths.
+ - Method‑channel arguments are now validated instead of force‑cast.
+ - Debug logging is no longer compiled into release builds.
+ - Corrected podspec metadata.
 ## [0.0.3] - April 8, 2026
 
 ### Added

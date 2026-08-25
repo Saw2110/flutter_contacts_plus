@@ -1,6 +1,5 @@
 package flutter.plugins.contactsservice.contactsservice;
 
-import android.annotation.TargetApi;
 import android.content.ContentProviderOperation;
 import android.content.ContentResolver;
 import android.content.ContentUris;
@@ -11,15 +10,14 @@ import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.net.Uri;
-import android.os.AsyncTask;
-import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
 import android.provider.BaseColumns;
 import android.provider.ContactsContract;
 import android.text.TextUtils;
 import android.util.Log;
 
 import java.io.ByteArrayOutputStream;
-import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -29,6 +27,7 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
@@ -50,7 +49,6 @@ import static android.provider.ContactsContract.CommonDataKinds.Phone;
 import static android.provider.ContactsContract.CommonDataKinds.StructuredName;
 import static android.provider.ContactsContract.CommonDataKinds.StructuredPostal;
 
-@TargetApi(Build.VERSION_CODES.ECLAIR)
 public class ContactsServicePlugin implements MethodCallHandler, FlutterPlugin, ActivityAware {
 
     private static final int FORM_OPERATION_CANCELED = 1;
@@ -62,8 +60,56 @@ public class ContactsServicePlugin implements MethodCallHandler, FlutterPlugin, 
     private BaseContactsServiceDelegate delegate;
     private Resources resources;
 
-    private final ExecutorService executor =
-            new ThreadPoolExecutor(0, 10, 60, TimeUnit.SECONDS, new ArrayBlockingQueue<Runnable>(1000));
+    /**
+     * Recreated on every engine attachment: {@code onDetachedFromEngine} shuts it down, and the
+     * same plugin instance can be attached to a new engine afterwards.
+     */
+    private ExecutorService executor;
+
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+
+    private static ExecutorService newExecutor() {
+        return new ThreadPoolExecutor(0, 10, 60, TimeUnit.SECONDS, new ArrayBlockingQueue<Runnable>(1000));
+    }
+
+    /**
+     * Submits background work, reporting the failure through {@code result} rather than throwing if
+     * the executor is gone or saturated.
+     */
+    private boolean submit(Runnable work, Result result) {
+        final ExecutorService current = this.executor;
+        if (current == null) {
+            result.error("contactsUnavailable", "Plugin is detached from the engine", null);
+            return false;
+        }
+        try {
+            current.execute(work);
+            return true;
+        } catch (RejectedExecutionException e) {
+            result.error("contactsUnavailable", "Too many pending contact requests", null);
+            return false;
+        }
+    }
+
+    /**
+     * Delivers a {@link Result} back on the main thread, which is the only thread a
+     * {@link MethodChannel.Result} may be invoked from.
+     *
+     * <p>The result is dropped if the plugin has been detached from the engine in the meantime -
+     * calling into a torn-down engine is what used to crash the app.
+     */
+    private void postResult(final Runnable delivery) {
+        mainHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                if (methodChannel == null) {
+                    // Detached from the engine while the background work was in flight.
+                    return;
+                }
+                delivery.run();
+            }
+        });
+    }
 
     private void initInstance(BinaryMessenger messenger, Context context) {
         methodChannel = new MethodChannel(messenger, "github.com/clovisnicolas/flutter_contacts");
@@ -74,17 +120,24 @@ public class ContactsServicePlugin implements MethodCallHandler, FlutterPlugin, 
     @Override
     public void onAttachedToEngine(FlutterPluginBinding binding) {
         resources = binding.getApplicationContext().getResources();
+        executor = newExecutor();
         initInstance(binding.getBinaryMessenger(), binding.getApplicationContext());
         this.delegate = new ContactServiceDelegate(binding.getApplicationContext());
     }
 
     @Override
     public void onDetachedFromEngine(FlutterPluginBinding binding) {
-        methodChannel.setMethodCallHandler(null);
+        if (methodChannel != null) {
+            methodChannel.setMethodCallHandler(null);
+        }
         methodChannel = null;
         contentResolver = null;
         this.delegate = null;
         resources = null;
+        if (executor != null) {
+            executor.shutdown();
+            executor = null;
+        }
     }
 
     @Override
@@ -205,17 +258,63 @@ public class ContactsServicePlugin implements MethodCallHandler, FlutterPlugin, 
             };
 
 
-    @TargetApi(Build.VERSION_CODES.ECLAIR)
     private void getContacts(String callMethod, String query, boolean withThumbnails, boolean photoHighResolution, boolean orderByGivenName, boolean localizedLabels, Result result) {
-        new GetContactsTask(callMethod, result, withThumbnails, photoHighResolution, orderByGivenName, localizedLabels).executeOnExecutor(executor, query, false);
+        submitGetContacts(callMethod, query, result, withThumbnails, photoHighResolution, orderByGivenName, localizedLabels);
     }
 
     private void getContactsForPhone(String callMethod, String phone, boolean withThumbnails, boolean photoHighResolution, boolean orderByGivenName, boolean localizedLabels, Result result) {
-        new GetContactsTask(callMethod, result, withThumbnails, photoHighResolution, orderByGivenName, localizedLabels).executeOnExecutor(executor, phone, true);
+        submitGetContacts(callMethod, phone, result, withThumbnails, photoHighResolution, orderByGivenName, localizedLabels);
     }
 
     private void getContactsForEmail(String callMethod, String email, boolean withThumbnails, boolean photoHighResolution, boolean orderByGivenName, boolean localizedLabels, Result result) {
-        new GetContactsTask(callMethod, result, withThumbnails, photoHighResolution, orderByGivenName, localizedLabels).executeOnExecutor(executor, email, true);
+        submitGetContacts(callMethod, email, result, withThumbnails, photoHighResolution, orderByGivenName, localizedLabels);
+    }
+
+    /**
+     * Snapshots everything the background job needs off the main thread and hands it to the
+     * executor.
+     *
+     * <p>The {@link ContentResolver} and {@link Resources} are captured here, on the main thread,
+     * rather than read from the plugin's fields inside the worker: {@code onDetachedFromEngine}
+     * nulls those fields, and a job already in flight would otherwise dereference null halfway
+     * through a contact list.
+     */
+    private void submitGetContacts(final String callMethod, final String queryArgument, final Result result,
+                                   final boolean withThumbnails, final boolean photoHighResolution,
+                                   final boolean orderByGivenName, final boolean localizedLabels) {
+        final ContentResolver resolver = this.contentResolver;
+        final Resources res = this.resources;
+        if (resolver == null) {
+            result.error("contactsUnavailable", "Plugin is detached from the engine", null);
+            return;
+        }
+        submit(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    final ArrayList<HashMap> contactMaps = loadContacts(callMethod, queryArgument, resolver, res,
+                            withThumbnails, photoHighResolution, orderByGivenName, localizedLabels);
+                    postResult(new Runnable() {
+                        @Override
+                        public void run() {
+                            if (contactMaps == null) {
+                                result.notImplemented();
+                            } else {
+                                result.success(contactMaps);
+                            }
+                        }
+                    });
+                } catch (final Exception e) {
+                    Log.e(LOG_TAG, "Failed to load contacts for " + callMethod, e);
+                    postResult(new Runnable() {
+                        @Override
+                        public void run() {
+                            result.error(callMethod, String.valueOf(e.getMessage()), null);
+                        }
+                    });
+                }
+            }
+        }, result);
     }
 
     @Override
@@ -285,19 +384,34 @@ public class ContactsServicePlugin implements MethodCallHandler, FlutterPlugin, 
                     finishWithResult(FORM_OPERATION_CANCELED);
                     return true;
                 }
-                Uri contactUri = intent.getData();
-                if (intent != null) {
-                    Cursor cursor = contentResolver.query(contactUri, null, null, null, null);
-                    if (cursor.moveToFirst()) {
+                // The picker can return a null Intent even for a non-cancelled result, so the null
+                // check has to come before getData() rather than after it.
+                final Uri contactUri = intent == null ? null : intent.getData();
+                final ContentResolver resolver = contentResolver;
+                if (contactUri == null || resolver == null) {
+                    finishWithResult(FORM_OPERATION_CANCELED);
+                    return true;
+                }
+
+                Cursor cursor = null;
+                try {
+                    cursor = resolver.query(contactUri, null, null, null, null);
+                    if (cursor != null && cursor.moveToFirst()) {
                         String id = contactUri.getLastPathSegment();
                         getContacts("openDeviceContactPicker", id, false, false, false, localizedLabels, this.result);
+                        // getContacts owns the Result from here on.
+                        this.result = null;
                     } else {
-                        Log.e(LOG_TAG, "onActivityResult - cursor.moveToFirst() returns false");
+                        Log.e(LOG_TAG, "onActivityResult - could not read the picked contact");
                         finishWithResult(FORM_OPERATION_CANCELED);
                     }
-                    cursor.close();
-                } else {
-                    return true;
+                } catch (Exception e) {
+                    Log.e(LOG_TAG, "onActivityResult - failed to read the picked contact", e);
+                    finishWithResult(FORM_OPERATION_CANCELED);
+                } finally {
+                    if (cursor != null) {
+                        cursor.close();
+                    }
                 }
                 return true;
             }
@@ -344,16 +458,20 @@ public class ContactsServicePlugin implements MethodCallHandler, FlutterPlugin, 
         }
 
         HashMap getContactByIdentifier(String identifier) {
+            final ContentResolver resolver = contentResolver;
+            if (resolver == null) {
+                return null;
+            }
             ArrayList<Contact> matchingContacts;
             {
-                Cursor cursor = contentResolver.query(
+                Cursor cursor = resolver.query(
                         ContactsContract.Data.CONTENT_URI, PROJECTION,
                         ContactsContract.RawContacts.CONTACT_ID + " = ?",
                         new String[]{identifier},
                         null
                 );
                 try {
-                    matchingContacts = getContactsFrom(cursor, localizedLabels);
+                    matchingContacts = getContactsFrom(cursor, resources, localizedLabels);
                 } finally {
                     if (cursor != null) {
                         cursor.close();
@@ -409,92 +527,67 @@ public class ContactsServicePlugin implements MethodCallHandler, FlutterPlugin, 
         }
     }
 
-    @TargetApi(Build.VERSION_CODES.CUPCAKE)
-    private class GetContactsTask extends AsyncTask<Object, Void, ArrayList<HashMap>> {
-
-        private String callMethod;
-        private Result getContactResult;
-        private boolean withThumbnails;
-        private boolean photoHighResolution;
-        private boolean orderByGivenName;
-        private boolean localizedLabels;
-
-        public GetContactsTask(String callMethod, Result result, boolean withThumbnails, boolean photoHighResolution, boolean orderByGivenName, boolean localizedLabels) {
-            this.callMethod = callMethod;
-            this.getContactResult = result;
-            this.withThumbnails = withThumbnails;
-            this.photoHighResolution = photoHighResolution;
-            this.orderByGivenName = orderByGivenName;
-            this.localizedLabels = localizedLabels;
+    /**
+     * Runs on a background thread. Every resource it touches is passed in, so nothing here can be
+     * torn out from under it by {@code onDetachedFromEngine}.
+     *
+     * @return the contacts as maps, or {@code null} if {@code callMethod} is unknown.
+     */
+    private ArrayList<HashMap> loadContacts(String callMethod, String queryArgument,
+                                            ContentResolver resolver, Resources res,
+                                            boolean withThumbnails, boolean photoHighResolution,
+                                            boolean orderByGivenName, boolean localizedLabels) {
+        ArrayList<Contact> contacts;
+        switch (callMethod) {
+            case "openDeviceContactPicker":
+                contacts = getContactsFrom(getCursor(resolver, null, queryArgument), res, localizedLabels);
+                break;
+            case "getContacts":
+                contacts = getContactsFrom(getCursor(resolver, queryArgument, null), res, localizedLabels);
+                break;
+            case "getContactsForPhone":
+                contacts = getContactsFrom(getCursorForPhone(resolver, queryArgument), res, localizedLabels);
+                break;
+            case "getContactsForEmail":
+                contacts = getContactsFrom(getCursorForEmail(resolver, queryArgument), res, localizedLabels);
+                break;
+            default:
+                return null;
         }
 
-        @TargetApi(Build.VERSION_CODES.ECLAIR)
-        protected ArrayList<HashMap> doInBackground(Object... params) {
-            ArrayList<Contact> contacts;
-            switch (callMethod) {
-                case "openDeviceContactPicker":
-                    contacts = getContactsFrom(getCursor(null, (String) params[0]), localizedLabels);
-                    break;
-                case "getContacts":
-                    contacts = getContactsFrom(getCursor((String) params[0], null), localizedLabels);
-                    break;
-                case "getContactsForPhone":
-                    contacts = getContactsFrom(getCursorForPhone(((String) params[0])), localizedLabels);
-                    break;
-                case "getContactsForEmail":
-                    contacts = getContactsFrom(getCursorForEmail(((String) params[0])), localizedLabels);
-                    break;
-                default:
-                    return null;
-            }
-
-            if (withThumbnails) {
-                for (Contact c : contacts) {
-                    final byte[] avatar = loadContactPhotoHighRes(
-                            c.identifier, photoHighResolution, contentResolver);
-                    if (avatar != null) {
-                        c.avatar = avatar;
-                    } else {
-                        // To stay backwards-compatible, return an empty byte array rather than `null`.
-                        c.avatar = new byte[0];
-                    }
-//          if ((Boolean) params[3])
-//              loadContactPhotoHighRes(c.identifier, (Boolean) params[3]);
-//          else
-//              setAvatarDataForContactIfAvailable(c);
+        if (withThumbnails) {
+            for (Contact c : contacts) {
+                final byte[] avatar = loadContactPhotoHighRes(c.identifier, photoHighResolution, resolver);
+                if (avatar != null) {
+                    c.avatar = avatar;
+                } else {
+                    // To stay backwards-compatible, return an empty byte array rather than `null`.
+                    c.avatar = new byte[0];
                 }
             }
-
-            if (orderByGivenName) {
-                Comparator<Contact> compareByGivenName = new Comparator<Contact>() {
-                    @Override
-                    public int compare(Contact contactA, Contact contactB) {
-                        return contactA.compareTo(contactB);
-                    }
-                };
-                Collections.sort(contacts, compareByGivenName);
-            }
-
-            //Transform the list of contacts to a list of Map
-            ArrayList<HashMap> contactMaps = new ArrayList<>();
-            for (Contact c : contacts) {
-                contactMaps.add(c.toMap());
-            }
-
-            return contactMaps;
         }
 
-        protected void onPostExecute(ArrayList<HashMap> result) {
-            if (result == null) {
-                getContactResult.notImplemented();
-            } else {
-                getContactResult.success(result);
-            }
+        if (orderByGivenName) {
+            Comparator<Contact> compareByGivenName = new Comparator<Contact>() {
+                @Override
+                public int compare(Contact contactA, Contact contactB) {
+                    return contactA.compareTo(contactB);
+                }
+            };
+            Collections.sort(contacts, compareByGivenName);
         }
+
+        //Transform the list of contacts to a list of Map
+        ArrayList<HashMap> contactMaps = new ArrayList<>();
+        for (Contact c : contacts) {
+            contactMaps.add(c.toMap());
+        }
+
+        return contactMaps;
     }
 
 
-    private Cursor getCursor(String query, String rawContactId) {
+    private Cursor getCursor(ContentResolver resolver, String query, String rawContactId) {
         String selection = "(" + ContactsContract.Data.MIMETYPE + "=? OR " + ContactsContract.Data.MIMETYPE + "=? OR "
                 + ContactsContract.Data.MIMETYPE + "=? OR " + ContactsContract.Data.MIMETYPE + "=? OR "
                 + ContactsContract.Data.MIMETYPE + "=? OR " + ContactsContract.Data.MIMETYPE + "=? OR "
@@ -511,18 +604,18 @@ public class ContactsServicePlugin implements MethodCallHandler, FlutterPlugin, 
             selectionArgs.add(rawContactId);
             selection += " AND " + ContactsContract.Data.CONTACT_ID + " =?";
         }
-        return contentResolver.query(ContactsContract.Data.CONTENT_URI, PROJECTION, selection, selectionArgs.toArray(new String[selectionArgs.size()]), null);
+        return resolver.query(ContactsContract.Data.CONTENT_URI, PROJECTION, selection, selectionArgs.toArray(new String[selectionArgs.size()]), null);
     }
 
-    private Cursor getCursorForPhone(String phone) {
-        if (phone.isEmpty())
+    private Cursor getCursorForPhone(ContentResolver resolver, String phone) {
+        if (phone == null || phone.isEmpty())
             return null;
 
         Uri uri = Uri.withAppendedPath(ContactsContract.PhoneLookup.CONTENT_FILTER_URI, Uri.encode(phone));
         String[] projection = new String[]{BaseColumns._ID};
 
         ArrayList<String> contactIds = new ArrayList<>();
-        Cursor phoneCursor = contentResolver.query(uri, projection, null, null, null);
+        Cursor phoneCursor = resolver.query(uri, projection, null, null, null);
         while (phoneCursor != null && phoneCursor.moveToNext()) {
             contactIds.add(phoneCursor.getString(phoneCursor.getColumnIndex(BaseColumns._ID)));
         }
@@ -532,18 +625,18 @@ public class ContactsServicePlugin implements MethodCallHandler, FlutterPlugin, 
         if (!contactIds.isEmpty()) {
             String contactIdsListString = contactIds.toString().replace("[", "(").replace("]", ")");
             String contactSelection = ContactsContract.Data.CONTACT_ID + " IN " + contactIdsListString;
-            return contentResolver.query(ContactsContract.Data.CONTENT_URI, PROJECTION, contactSelection, null, null);
+            return resolver.query(ContactsContract.Data.CONTENT_URI, PROJECTION, contactSelection, null, null);
         }
 
         return null;
     }
 
-    private Cursor getCursorForEmail(String email) {
-        if (email.isEmpty())
+    private Cursor getCursorForEmail(ContentResolver resolver, String email) {
+        if (email == null || email.isEmpty())
             return null;
         ArrayList<String> selectionArgs = new ArrayList<>(Arrays.asList("%" + email + "%"));
         String selection = Email.ADDRESS + " LIKE ?";
-        return contentResolver.query(ContactsContract.Data.CONTENT_URI, PROJECTION, selection, selectionArgs.toArray(new String[selectionArgs.size()]), null);
+        return resolver.query(ContactsContract.Data.CONTENT_URI, PROJECTION, selection, selectionArgs.toArray(new String[selectionArgs.size()]), null);
     }
 
     /**
@@ -552,7 +645,7 @@ public class ContactsServicePlugin implements MethodCallHandler, FlutterPlugin, 
      * @param cursor
      * @return the list of contacts
      */
-    private ArrayList<Contact> getContactsFrom(Cursor cursor, boolean localizedLabels) {
+    private ArrayList<Contact> getContactsFrom(Cursor cursor, Resources resources, boolean localizedLabels) {
         HashMap<String, Contact> map = new LinkedHashMap<>();
 
         while (cursor != null && cursor.moveToNext()) {
@@ -630,69 +723,60 @@ public class ContactsServicePlugin implements MethodCallHandler, FlutterPlugin, 
         return new ArrayList<>(map.values());
     }
 
-    private void setAvatarDataForContactIfAvailable(Contact contact) {
-        Uri contactUri = ContentUris.withAppendedId(ContactsContract.Contacts.CONTENT_URI, Integer.parseInt(contact.identifier));
-        Uri photoUri = Uri.withAppendedPath(contactUri, ContactsContract.Contacts.Photo.CONTENT_DIRECTORY);
-        Cursor avatarCursor = contentResolver.query(photoUri,
-                new String[]{ContactsContract.Contacts.Photo.PHOTO}, null, null, null);
-        if (avatarCursor != null && avatarCursor.moveToFirst()) {
-            byte[] avatar = avatarCursor.getBlob(0);
-            contact.avatar = avatar;
-        }
-        if (avatarCursor != null) {
-            avatarCursor.close();
-        }
-    }
-
     private void getAvatar(final Contact contact, final boolean highRes,
                            final Result result) {
-        new GetAvatarsTask(contact, highRes, contentResolver, result).executeOnExecutor(this.executor);
+        final ContentResolver resolver = this.contentResolver;
+        if (resolver == null) {
+            result.error("contactsUnavailable", "Plugin is detached from the engine", null);
+            return;
+        }
+        submit(new Runnable() {
+            @Override
+            public void run() {
+                final byte[] avatar = loadContactPhotoHighRes(contact.identifier, highRes, resolver);
+                postResult(new Runnable() {
+                    @Override
+                    public void run() {
+                        result.success(avatar);
+                    }
+                });
+            }
+        }, result);
     }
 
-    private static class GetAvatarsTask extends AsyncTask<Void, Void, byte[]> {
-        final Contact contact;
-        final boolean highRes;
-        final ContentResolver contentResolver;
-        final Result result;
-
-        GetAvatarsTask(final Contact contact, final boolean highRes,
-                       final ContentResolver contentResolver, final Result result) {
-            this.contact = contact;
-            this.highRes = highRes;
-            this.contentResolver = contentResolver;
-            this.result = result;
-        }
-
-        @Override
-        protected byte[] doInBackground(final Void... params) {
-            // Load avatar for each contact identifier.
-            return loadContactPhotoHighRes(contact.identifier, highRes, contentResolver);
-        }
-
-        @Override
-        protected void onPostExecute(final byte[] avatar) {
-            result.success(avatar);
-        }
-    }
-
+    /**
+     * Reads a contact's photo. Never throws: a contact whose avatar cannot be read is not a reason
+     * to fail the whole request, so every failure mode returns {@code null} and the caller
+     * substitutes an empty byte array.
+     */
     private static byte[] loadContactPhotoHighRes(final String identifier,
                                                   final boolean photoHighResolution, final ContentResolver contentResolver) {
+        if (contentResolver == null || identifier == null) return null;
         try {
             final Uri uri = ContentUris.withAppendedId(ContactsContract.Contacts.CONTENT_URI, Long.parseLong(identifier));
             final InputStream input = ContactsContract.Contacts.openContactPhotoInputStream(contentResolver, uri, photoHighResolution);
 
             if (input == null) return null;
 
-            final Bitmap bitmap = BitmapFactory.decodeStream(input);
-            input.close();
+            final Bitmap bitmap;
+            try {
+                bitmap = BitmapFactory.decodeStream(input);
+            } finally {
+                input.close();
+            }
+
+            // decodeStream returns null for a corrupt or unsupported photo blob.
+            if (bitmap == null) return null;
 
             final ByteArrayOutputStream stream = new ByteArrayOutputStream();
             bitmap.compress(Bitmap.CompressFormat.PNG, 100, stream);
             final byte[] bytes = stream.toByteArray();
             stream.close();
             return bytes;
-        } catch (final IOException ex) {
-            Log.e(LOG_TAG, ex.getMessage());
+        } catch (final Exception ex) {
+            // Catches NumberFormatException from a non-numeric identifier, SecurityException when
+            // the contacts permission is revoked mid-run, and IOException from the stream.
+            Log.e(LOG_TAG, "Failed to load photo for contact " + identifier + ": " + ex.getMessage());
             return null;
         }
     }
