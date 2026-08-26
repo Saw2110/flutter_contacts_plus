@@ -18,13 +18,17 @@ ios
 
 Android
  - Replaced deprecated `AsyncTask`, removing the "uses or overrides a deprecated API" build warning (#2, thanks @tylyo).
- - Raised `compileSdk` to 36 and modernized the build script for AGP 8.
 
 ios
  - Removed deprecated `keyWindow` usage and dead pre‑iOS‑13 code paths.
  - Method‑channel arguments are now validated instead of force‑cast.
  - Debug logging is no longer compiled into release builds.
  - Corrected podspec metadata.
+
+> **Note:** on iOS, `openContactForm` previously hung forever if no view controller could be
+> resolved; it now throws `FormOperationException(FORM_COULD_NOT_BE_OPEN)`. Wrap it in
+> `try`/`catch` as shown in the README.
+
 ## [0.0.3] - April 8, 2026
 
 ### Added
