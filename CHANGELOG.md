@@ -10,7 +10,7 @@ Android
  - Fixed crash when the device contact picker is closed without a selection.
  - Background failures now surface as a `PlatformException` instead of crashing.
 
-ios
+iOS
  - The contact form, existing-contact view, and picker now open correctly when another modal is already on screen.
  - `openContactForm` no longer hangs when no view controller is available.
 
@@ -19,7 +19,7 @@ ios
 Android
  - Replaced deprecated `AsyncTask`, removing the "uses or overrides a deprecated API" build warning (#2, thanks @tylyo).
 
-ios
+iOS
  - Removed deprecated `keyWindow` usage and dead pre‑iOS‑13 code paths.
  - Method‑channel arguments are now validated instead of force‑cast.
  - Debug logging is no longer compiled into release builds.
